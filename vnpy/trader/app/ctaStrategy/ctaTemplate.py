@@ -5,8 +5,9 @@
 '''
 
 from vnpy.trader.vtConstant import *
+from vnpy.trader.vtUtility import BarGenerator, ArrayManager
 
-from vnpy.trader.app.ctaStrategy.ctaBase import *
+from .ctaBase import *
 
 
 ########################################################################
@@ -42,6 +43,9 @@ class CtaTemplate(object):
     varList = ['inited',
                'trading',
                'pos']
+    
+    # 同步列表，保存了需要保存到数据库的变量名称
+    syncList = ['pos']
 
     #----------------------------------------------------------------------
     def __init__(self, ctaEngine, setting):
@@ -121,13 +125,13 @@ class CtaTemplate(object):
         if self.trading:
             # 如果stop为True，则意味着发本地停止单
             if stop:
-                vtOrderID = self.ctaEngine.sendStopOrder(self.vtSymbol, orderType, price, volume, self)
+                vtOrderIDList = self.ctaEngine.sendStopOrder(self.vtSymbol, orderType, price, volume, self)
             else:
-                vtOrderID = self.ctaEngine.sendOrder(self.vtSymbol, orderType, price, volume, self) 
-            return vtOrderID
+                vtOrderIDList = self.ctaEngine.sendOrder(self.vtSymbol, orderType, price, volume, self) 
+            return vtOrderIDList
         else:
             # 交易停止时发单返回空字符串
-            return ''        
+            return []
         
     #----------------------------------------------------------------------
     def cancelOrder(self, vtOrderID):
@@ -140,6 +144,11 @@ class CtaTemplate(object):
             self.ctaEngine.cancelStopOrder(vtOrderID)
         else:
             self.ctaEngine.cancelOrder(vtOrderID)
+            
+    #----------------------------------------------------------------------
+    def cancelAll(self):
+        """全部撤单"""
+        self.ctaEngine.cancelAll(self.name)
     
     #----------------------------------------------------------------------
     def insertTick(self, tick):
@@ -177,6 +186,17 @@ class CtaTemplate(object):
         """查询当前运行的环境"""
         return self.ctaEngine.engineType
     
+    #----------------------------------------------------------------------
+    def saveSyncData(self):
+        """保存同步数据到数据库"""
+        if self.trading:
+            self.ctaEngine.saveSyncData(self)
+    
+    #----------------------------------------------------------------------
+    def getPriceTick(self):
+        """查询最小价格变动"""
+        return self.ctaEngine.getPriceTick(self)
+        
 
 ########################################################################
 class TargetPosTemplate(CtaTemplate):
@@ -237,7 +257,8 @@ class TargetPosTemplate(CtaTemplate):
     def onOrder(self, order):
         """收到委托推送"""
         if order.status == STATUS_ALLTRADED or order.status == STATUS_CANCELLED:
-            self.orderList.remove(order.vtOrderID)
+            if order.vtOrderID in self.orderList:
+                self.orderList.remove(order.vtOrderID)
     
     #----------------------------------------------------------------------
     def setTargetPos(self, targetPos):
@@ -250,9 +271,7 @@ class TargetPosTemplate(CtaTemplate):
     def trade(self):
         """执行交易"""
         # 先撤销之前的委托
-        for vtOrderID in self.orderList:
-            self.cancelOrder(vtOrderID)
-        self.orderList = []
+        self.cancelAll()
         
         # 如果目标仓位和实际仓位一致，则不进行任何操作
         posChange = self.targetPos - self.pos
@@ -266,8 +285,12 @@ class TargetPosTemplate(CtaTemplate):
         if self.lastTick:
             if posChange > 0:
                 longPrice = self.lastTick.askPrice1 + self.tickAdd
+                if self.lastTick.upperLimit:
+                    longPrice = min(longPrice, self.lastTick.upperLimit)         # 涨停价检查
             else:
                 shortPrice = self.lastTick.bidPrice1 - self.tickAdd
+                if self.lastTick.lowerLimit:
+                    shortPrice = max(shortPrice, self.lastTick.lowerLimit)       # 跌停价检查
         else:
             if posChange > 0:
                 longPrice = self.lastBar.close + self.tickAdd
@@ -277,10 +300,10 @@ class TargetPosTemplate(CtaTemplate):
         # 回测模式下，采用合并平仓和反向开仓委托的方式
         if self.getEngineType() == ENGINETYPE_BACKTESTING:
             if posChange > 0:
-                vtOrderID = self.buy(longPrice, abs(posChange))
+                l = self.buy(longPrice, abs(posChange))
             else:
-                vtOrderID = self.short(shortPrice, abs(posChange))
-            self.orderList.append(vtOrderID)
+                l = self.short(shortPrice, abs(posChange))
+            self.orderList.extend(l)
         
         # 实盘模式下，首先确保之前的委托都已经结束（全成、撤销）
         # 然后先发平仓委托，等待成交后，再发送新的开仓委托
@@ -291,15 +314,56 @@ class TargetPosTemplate(CtaTemplate):
             
             # 买入
             if posChange > 0:
+                # 若当前有空头持仓
                 if self.pos < 0:
-                    vtOrderID = self.cover(longPrice, abs(self.pos))
+                    # 若买入量小于空头持仓，则直接平空买入量
+                    if posChange < abs(self.pos):
+                        l = self.cover(longPrice, posChange)
+                    # 否则先平所有的空头仓位
+                    else:
+                        l = self.cover(longPrice, abs(self.pos))
+                # 若没有空头持仓，则执行开仓操作
                 else:
-                    vtOrderID = self.buy(longPrice, abs(posChange))
-            # 卖出
+                    l = self.buy(longPrice, abs(posChange))
+            # 卖出和以上相反
             else:
                 if self.pos > 0:
-                    vtOrderID = self.sell(shortPrice, abs(self.pos))
+                    if abs(posChange) < self.pos:
+                        l = self.sell(shortPrice, abs(posChange))
+                    else:
+                        l = self.sell(shortPrice, abs(self.pos))
                 else:
-                    vtOrderID = self.short(shortPrice, abs(posChange))
-            self.orderList.append(vtOrderID)
+                    l = self.short(shortPrice, abs(posChange))
+            self.orderList.extend(l)
     
+
+########################################################################
+class CtaSignal(object):
+    """
+    CTA策略信号，负责纯粹的信号生成（目标仓位），不参与具体交易管理
+    """
+
+    #----------------------------------------------------------------------
+    def __init__(self):
+        """Constructor"""
+        self.signalPos = 0      # 信号仓位
+    
+    #----------------------------------------------------------------------
+    def onBar(self, bar):
+        """K线推送"""
+        pass
+    
+    #----------------------------------------------------------------------
+    def onTick(self, tick):
+        """Tick推送"""
+        pass
+        
+    #----------------------------------------------------------------------
+    def setSignalPos(self, pos):
+        """设置信号仓位"""
+        self.signalPos = pos
+        
+    #----------------------------------------------------------------------
+    def getSignalPos(self):
+        """获取信号仓位"""
+        return self.signalPos

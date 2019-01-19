@@ -1,7 +1,6 @@
 {
-    "accessKey": "火币网站申请",
-    "secretKey": "火币网站申请",
-    "interval": 0.5,
-    "market": "cny",
-    "debug": false
+	"exchange": "huobi",
+	"accessKey": "",
+	"secretKey": "",
+	"symbols": ["btcusdt","ethusdt","ethbtc"]
 }
